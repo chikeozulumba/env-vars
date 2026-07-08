@@ -15,11 +15,14 @@ import {
 	useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
 	AlertTriangle,
 	ArrowDown,
 	ArrowUp,
 	ArrowUpDown,
+	Copy,
+	Download,
 	ExternalLink,
 	GripVertical,
 	Plus,
@@ -28,7 +31,14 @@ import {
 	WrapText,
 	X,
 } from "lucide-react";
-import { type MouseEvent as ReactMouseEvent, useMemo, useState } from "react";
+import {
+	type MouseEvent as ReactMouseEvent,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
+import { ExportVariablesModal } from "#/components/ExportVariablesModal";
 import { ImportVariablesModal } from "#/components/ImportVariablesModal";
 
 type EnvColumn = {
@@ -84,6 +94,49 @@ const initialVariables: EnvVariable[] = [
 	},
 ];
 
+const STORAGE_KEY = "envsort:sheet-state";
+
+type PersistedState = {
+	columns: EnvColumn[];
+	variables: EnvVariable[];
+	columnWidths: Record<string, number>;
+	sortDirection: "asc" | "desc" | null;
+	wrapValues: boolean;
+};
+
+function loadPersistedState(): PersistedState | null {
+	if (typeof window === "undefined") return null;
+	try {
+		const raw = window.localStorage.getItem(STORAGE_KEY);
+		if (!raw) return null;
+		const parsed = JSON.parse(raw);
+		if (
+			!parsed ||
+			typeof parsed !== "object" ||
+			!Array.isArray(parsed.columns) ||
+			!Array.isArray(parsed.variables)
+		) {
+			return null;
+		}
+		return {
+			columns: parsed.columns,
+			variables: parsed.variables,
+			columnWidths: parsed.columnWidths ?? {},
+			sortDirection: parsed.sortDirection ?? null,
+			wrapValues: Boolean(parsed.wrapValues),
+		};
+	} catch {
+		return null;
+	}
+}
+
+function bumpIdCounterPastPersisted(state: PersistedState) {
+	for (const item of [...state.columns, ...state.variables]) {
+		const match = /-(\d+)$/.exec(item.id);
+		if (match) idCounter = Math.max(idCounter, Number(match[1]));
+	}
+}
+
 const ROW_NUM_COL_WIDTH = 40;
 const VARIABLE_COL_ID = "__variable__";
 const DEFAULT_VARIABLE_COL_WIDTH = 220;
@@ -126,21 +179,110 @@ export function EnvVarSheet() {
 	const [columns, setColumns] = useState(initialColumns);
 	const [variables, setVariables] = useState(initialVariables);
 	const [isImportOpen, setIsImportOpen] = useState(false);
+	const [isExportOpen, setIsExportOpen] = useState(false);
 	const [columnWidths, setColumnWidths] = useState<Record<string, number>>({});
 	const [sortDirection, setSortDirection] = useState<"asc" | "desc" | null>(
 		null,
 	);
 	const [activeColumnId, setActiveColumnId] = useState<string | null>(null);
 	const [wrapValues, setWrapValues] = useState(false);
+	const [isHydrated, setIsHydrated] = useState(false);
 	const sensors = useSensors(
 		useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
 	);
+
+	// Restore persisted state after mount, not during the initial render, so
+	// the server-rendered defaults match the client's first paint (avoids a
+	// hydration mismatch) and so we never overwrite storage before reading it.
+	useEffect(() => {
+		const state = loadPersistedState();
+		if (state) {
+			bumpIdCounterPastPersisted(state);
+			setColumns(state.columns);
+			setVariables(state.variables);
+			setColumnWidths(state.columnWidths);
+			setSortDirection(state.sortDirection);
+			setWrapValues(state.wrapValues);
+		}
+		setIsHydrated(true);
+	}, []);
+
+	useEffect(() => {
+		if (!isHydrated) return;
+		const state: PersistedState = {
+			columns,
+			variables,
+			columnWidths,
+			sortDirection,
+			wrapValues,
+		};
+		window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+	}, [isHydrated, columns, variables, columnWidths, sortDirection, wrapValues]);
 
 	const displayedVariables = useMemo(() => {
 		if (!sortDirection) return variables;
 		const sorted = [...variables].sort((a, b) => a.name.localeCompare(b.name));
 		return sortDirection === "asc" ? sorted : sorted.reverse();
 	}, [variables, sortDirection]);
+
+	const duplicateNames = useMemo(() => {
+		const counts: Record<string, number> = {};
+		for (const variable of variables) {
+			const name = variable.name.trim();
+			if (!name) continue;
+			counts[name] = (counts[name] ?? 0) + 1;
+		}
+		return new Set(
+			Object.entries(counts)
+				.filter(([, count]) => count > 1)
+				.map(([name]) => name),
+		);
+	}, [variables]);
+
+	const hasDuplicateNames = duplicateNames.size > 0;
+
+	const scrollContainerRef = useRef<HTMLDivElement>(null);
+	const rowVirtualizer = useVirtualizer({
+		count: displayedVariables.length,
+		getScrollElement: () => scrollContainerRef.current,
+		estimateSize: () => 34,
+		overscan: 8,
+	});
+	const virtualItems = rowVirtualizer.getVirtualItems();
+	const virtualPaddingTop = virtualItems.length > 0 ? virtualItems[0].start : 0;
+	const virtualPaddingBottom =
+		virtualItems.length > 0
+			? rowVirtualizer.getTotalSize() -
+				virtualItems[virtualItems.length - 1].end
+			: 0;
+	const totalColumnCount = columns.length + 3;
+
+	const nameInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+	const [focusVariableId, setFocusVariableId] = useState<string | null>(null);
+
+	useEffect(() => {
+		if (!focusVariableId) return;
+		const index = displayedVariables.findIndex(
+			(variable) => variable.id === focusVariableId,
+		);
+		if (index !== -1) rowVirtualizer.scrollToIndex(index, { align: "auto" });
+
+		let rafId: number;
+		let attempts = 0;
+		function tryFocus() {
+			const input = nameInputRefs.current[focusVariableId as string];
+			if (input) {
+				input.focus();
+				input.select();
+				setFocusVariableId(null);
+				return;
+			}
+			attempts += 1;
+			if (attempts < 20) rafId = requestAnimationFrame(tryFocus);
+		}
+		rafId = requestAnimationFrame(tryFocus);
+		return () => cancelAnimationFrame(rafId);
+	}, [focusVariableId, displayedVariables, rowVirtualizer]);
 
 	function getColumnWidth(id: string, fallback: number) {
 		return columnWidths[id] ?? fallback;
@@ -223,6 +365,24 @@ export function EnvVarSheet() {
 		setVariables((vars) => vars.filter((variable) => variable.id !== id));
 	}
 
+	function duplicateVariable(id: string) {
+		const newId = nextId("var");
+		setVariables((vars) => {
+			const index = vars.findIndex((variable) => variable.id === id);
+			if (index === -1) return vars;
+			const source = vars[index];
+			const copy: EnvVariable = {
+				id: newId,
+				name: source.name,
+				values: { ...source.values },
+			};
+			const next = [...vars];
+			next.splice(index + 1, 0, copy);
+			return next;
+		});
+		setFocusVariableId(newId);
+	}
+
 	function renameVariable(id: string, name: string) {
 		setVariables((vars) =>
 			vars.map((variable) =>
@@ -279,11 +439,13 @@ export function EnvVarSheet() {
 		) {
 			return;
 		}
+		window.localStorage.removeItem(STORAGE_KEY);
 		setColumns(initialColumns);
 		setVariables(initialVariables);
 		setColumnWidths({});
 		setSortDirection(null);
 		setActiveColumnId(null);
+		setWrapValues(false);
 	}
 
 	return (
@@ -327,14 +489,41 @@ export function EnvVarSheet() {
 						>
 							<Upload size={14} /> Import
 						</button>
+						<button
+							type="button"
+							onClick={() => setIsExportOpen(true)}
+							disabled={columns.length === 0}
+							className="flex items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-sm font-medium text-zinc-200 transition-colors hover:border-yellow-500/50 hover:text-yellow-400 disabled:cursor-not-allowed disabled:opacity-50"
+						>
+							<Download size={14} /> Export
+						</button>
 					</div>
 				</div>
+
+				{hasDuplicateNames && (
+					<div className="mb-4 flex shrink-0 items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
+						<AlertTriangle size={14} className="shrink-0 text-amber-400" />
+						Duplicate variable name
+						{duplicateNames.size === 1 ? "" : "s"} found:{" "}
+						<span className="font-mono text-amber-200">
+							{[...duplicateNames].join(", ")}
+						</span>
+					</div>
+				)}
 
 				{isImportOpen && (
 					<ImportVariablesModal
 						columns={columns}
 						onClose={() => setIsImportOpen(false)}
 						onImport={importVariables}
+					/>
+				)}
+
+				{isExportOpen && (
+					<ExportVariablesModal
+						columns={columns}
+						variables={variables}
+						onClose={() => setIsExportOpen(false)}
 					/>
 				)}
 
@@ -345,9 +534,12 @@ export function EnvVarSheet() {
 					onDragStart={handleColumnDragStart}
 					onDragEnd={handleColumnDragEnd}
 				>
-					<div className="overflow-auto rounded-lg border border-zinc-800 bg-black">
+					<div
+						ref={scrollContainerRef}
+						className="max-h-[70vh] overflow-auto rounded-lg border border-zinc-800 bg-black"
+					>
 						<table
-							className="border-collapse text-sm"
+							className="border-collapse text-sm w-full"
 							style={{ tableLayout: "fixed" }}
 						>
 							<colgroup>
@@ -434,18 +626,46 @@ export function EnvVarSheet() {
 								</tr>
 							</thead>
 							<tbody>
-								{displayedVariables.map((variable, rowIndex) => {
+								{virtualPaddingTop > 0 && (
+									<tr>
+										<td
+											colSpan={totalColumnCount}
+											style={{ height: virtualPaddingTop }}
+										/>
+									</tr>
+								)}
+								{virtualItems.map((virtualRow) => {
+									const variable = displayedVariables[virtualRow.index];
+									const rowIndex = virtualRow.index;
 									const anyValueSet = columns.some(
 										(col) => (variable.values[col.id] ?? "").trim() !== "",
 									);
+									const isDuplicateName = duplicateNames.has(
+										variable.name.trim(),
+									);
+									const rowCellBg = isDuplicateName
+										? "bg-amber-500/10 group-hover/row:bg-amber-500/20"
+										: "bg-black group-hover/row:bg-zinc-950";
 									return (
-										<tr key={variable.id} className="group/row">
-											<td className="sticky left-0 z-10 border-r border-b border-zinc-800 bg-black px-2 py-1 text-center text-xs text-zinc-600 group-hover/row:bg-zinc-950">
+										<tr
+											key={variable.id}
+											data-index={virtualRow.index}
+											ref={rowVirtualizer.measureElement}
+											className="group/row"
+										>
+											<td
+												className={`sticky left-0 z-10 border-r border-b border-zinc-800 px-2 py-1 text-center text-xs text-zinc-600 ${rowCellBg}`}
+											>
 												{rowIndex + 1}
 											</td>
-											<td className="sticky left-10 z-10 border-r border-b border-zinc-800 bg-black px-0 py-0 group-hover/row:bg-zinc-950">
+											<td
+												className={`sticky left-10 z-10 border-r border-b border-zinc-800 px-0 py-0 ${rowCellBg}`}
+											>
 												<div className="flex items-center gap-1 px-3 py-1">
 													<input
+														ref={(el) => {
+															nameInputRefs.current[variable.id] = el;
+														}}
 														value={variable.name}
 														onChange={(event) =>
 															renameVariable(variable.id, event.target.value)
@@ -453,6 +673,14 @@ export function EnvVarSheet() {
 														placeholder="VARIABLE_NAME"
 														className="w-full min-w-0 bg-transparent font-mono text-sm text-zinc-100 outline-none placeholder:text-zinc-700 focus:rounded focus:bg-zinc-900 focus:px-1 focus:ring-2 focus:ring-yellow-500/60"
 													/>
+													<button
+														type="button"
+														onClick={() => duplicateVariable(variable.id)}
+														aria-label={`Duplicate ${variable.name || "row"}`}
+														className="shrink-0 rounded p-0.5 text-zinc-600 opacity-0 hover:bg-yellow-500/10 hover:text-yellow-400 group-hover/row:opacity-100"
+													>
+														<Copy size={13} />
+													</button>
 													<button
 														type="button"
 														onClick={() => removeVariable(variable.id)}
@@ -473,9 +701,11 @@ export function EnvVarSheet() {
 													<td
 														key={col.id}
 														className={`border-r border-b border-zinc-800 px-0 py-0 ${
-															isMissing
-																? "bg-red-500/10"
-																: "bg-black group-hover/row:bg-zinc-950"
+															isDuplicateName
+																? rowCellBg
+																: isMissing
+																	? "bg-red-500/10"
+																	: "bg-black group-hover/row:bg-zinc-950"
 														}`}
 													>
 														<div className="flex items-center gap-1.5 px-3 py-1">
@@ -539,10 +769,20 @@ export function EnvVarSheet() {
 													</td>
 												);
 											})}
-											<td className="border-b border-zinc-800 bg-black" />
+											<td className={`border-b border-zinc-800 ${rowCellBg}`} />
 										</tr>
 									);
 								})}
+								{virtualPaddingBottom > 0 && (
+									<tr>
+										<td
+											colSpan={totalColumnCount}
+											style={{ height: virtualPaddingBottom }}
+										/>
+									</tr>
+								)}
+							</tbody>
+							<tbody>
 								<tr>
 									<td className="border-r border-zinc-800 bg-black px-2 py-1.5" />
 									<td className="sticky left-10 border-r border-zinc-800 bg-black px-3 py-1.5">

@@ -1,6 +1,7 @@
 {
-  "short_name": "TanStack App",
-  "name": "Create TanStack App Sample",
+  "short_name": "Envvars",
+  "name": "Envvars — Organize, Diff & Export Environment Variables",
+  "description": "A spreadsheet for your .env files. Sort, compare, and export environment variables across dev, staging, and production.",
   "icons": [
     {
       "src": "favicon.ico",
@@ -20,6 +21,6 @@
   ],
   "start_url": ".",
   "display": "standalone",
-  "theme_color": "#000000",
-  "background_color": "#ffffff"
+  "theme_color": "#030712",
+  "background_color": "#030712"
 }
